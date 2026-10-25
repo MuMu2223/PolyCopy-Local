@@ -1,4 +1,4 @@
-# core/executor.py
+# core/executor.py (更新执行逻辑)
 from typing import Dict, Any
 from config import settings
 from utils.logger import logger
@@ -6,16 +6,14 @@ from database.db import get_db
 from database.models import record_trade, add_system_log
 from risk.manager import risk_mgr
 from core.api_client import poly_client
+from core.simulator import sandbox
 
 
 class TradeExecutor:
-    """負責實際訂單發送、重試防護與本地倉位更新"""
-
     def __init__(self):
-        self.dry_run = settings.DRY_RUN
+        pass
 
     def update_position_record(self, trade_plan: Dict[str, Any]):
-        """下單成功後更新本地持倉資料表"""
         condition_id = trade_plan["condition_id"]
         outcome_index = trade_plan["outcome_index"]
         token_id = trade_plan.get("token_id")
@@ -27,7 +25,6 @@ class TradeExecutor:
         with get_db() as conn:
             cursor = conn.cursor()
             if action_type in ["OPEN", "ADD"]:
-                # 開倉或加倉
                 cursor.execute("""
                     INSERT INTO positions (
                         condition_id, outcome_index, token_id, shares,
@@ -42,63 +39,64 @@ class TradeExecutor:
                 """, (condition_id, outcome_index, token_id, shares, price, amount_usd, price))
 
             elif action_type == "CLOSE":
-                # 平倉：全數清除或扣減倉位
                 cursor.execute("DELETE FROM positions WHERE condition_id = ? AND outcome_index = ?", (condition_id, outcome_index))
 
     def execute(self, trade_plan: Dict[str, Any]) -> bool:
-        """
-        執行跟單交易流程
-        """
         tx_hash = trade_plan["tx_hash"]
         side = trade_plan["side"]
         token_id = trade_plan["token_id"]
         price = trade_plan["price"]
         shares = trade_plan["copy_shares"]
         action = trade_plan["action_type"]
+        copy_usd = trade_plan["copy_amount_usd"]
 
-        # 1. 執行前置風控審核
-        passed, reason = risk_mgr.validate_trade_execution(trade_plan)
-        if not passed:
-            logger.warning(f"風控攔截 [Tx: {tx_hash[:10]}...]: {reason}")
-            trade_plan["status"] = "SKIPPED"
-            trade_plan["error_msg"] = reason
-            record_trade(trade_plan)
-            add_system_log("WARNING", "executor", f"跟單略過: {reason}")
-            return False
+        # 1. 模拟模式下资金校验
+        if settings.DRY_RUN:
+            if action in ["OPEN", "ADD"]:
+                if not sandbox.simulate_buy(copy_usd):
+                    add_system_log("WARNING", "executor", f"沙盒虚拟资金不足，跳过跟单 ${copy_usd:.2f}")
+                    return False
+            elif action == "CLOSE":
+                # 简单估算平仓回款
+                return_usd = shares * price
+                sandbox.simulate_sell(return_usd, copy_usd)
 
-        # 2. 發送訂單至 Polymarket CLOB
-        try:
-            logger.info(f"開始執行跟單 => 動作: {action} | 標的: {token_id} | 價格: {price} | 份額: {shares}")
-            resp = poly_client.place_order(
-                token_id=token_id,
-                price=price,
-                size=shares,
-                side=side
-            )
-
-            # 3. 處理訂單回報狀態
-            status = "FILLED" if (self.dry_run or resp.get("status") in ["matched", "FILLED", "DRY_RUN"]) else "PENDING"
-            trade_plan["status"] = status
+            trade_plan["status"] = "DRY_RUN"
             trade_plan["error_msg"] = None
-
-            # 記錄至資料庫
             record_trade(trade_plan)
             self.update_position_record(trade_plan)
-
-            log_msg = f"跟單執行成功 [{status}]! 動作: {action}, 金額: ${trade_plan['copy_amount_usd']:.2f}, 標的: {token_id}"
+            log_msg = f"[沙盒模拟] 成功复刻交易: {action} | 标的: {token_id[:10]}... | 虚拟金额: ${copy_usd:.2f}"
             logger.info(log_msg)
             add_system_log("INFO", "executor", log_msg)
             return True
 
-        except Exception as e:
-            err_msg = f"下單失敗: {str(e)}"
-            logger.error(f"跟單下單異常 [Tx: {tx_hash}]: {err_msg}")
-            trade_plan["status"] = "FAILED"
-            trade_plan["error_msg"] = err_msg
+        # 2. 实盘模式检查（必须有私钥与风控审核）
+        if not settings.WALLET_PRIVATE_KEY:
+            logger.error("未配置 WALLET_PRIVATE_KEY，无法开启实盘交易！已自动拦截。")
+            return False
+
+        passed, reason = risk_mgr.validate_trade_execution(trade_plan)
+        if not passed:
+            logger.warning(f"实盘风控拦截 [Tx: {tx_hash[:10]}...]: {reason}")
+            trade_plan["status"] = "SKIPPED"
+            trade_plan["error_msg"] = reason
             record_trade(trade_plan)
-            add_system_log("ERROR", "executor", err_msg)
+            add_system_log("WARNING", "executor", f"实盘风控拦截: {reason}")
+            return False
+
+        try:
+            resp = poly_client.place_order(token_id=token_id, price=price, size=shares, side=side)
+            status = "FILLED" if resp.get("status") in ["matched", "FILLED"] else "PENDING"
+            trade_plan["status"] = status
+            record_trade(trade_plan)
+            self.update_position_record(trade_plan)
+            logger.info(f"实盘跟单已广播至 CLOB [{status}]: 金额 ${copy_usd:.2f}")
+            return True
+        except Exception as e:
+            trade_plan["status"] = "FAILED"
+            trade_plan["error_msg"] = str(e)
+            record_trade(trade_plan)
             return False
 
 
-# 匯出單例物件
 trade_executor = TradeExecutor()
