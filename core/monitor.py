@@ -1,10 +1,11 @@
 # core/monitor.py
 import asyncio
 import time
-from typing import List
+from typing import List, Dict, Any
 from config import settings
 from utils.logger import logger
-from database.models import get_all_tracked_addresses, is_tx_already_copied, add_system_log
+from database.db import get_db
+from database.models import get_all_tracked_addresses, add_system_log
 from core.api_client import poly_client
 from core.leaderboard import leaderboard_mgr
 from core.matcher import trade_matcher
@@ -12,98 +13,113 @@ from core.executor import trade_executor
 
 
 class TradeMonitor:
-    """非同步交易監控器：持續監聽前 100 名玩家動態並觸發自動跟單"""
-
     def __init__(self):
         self.poll_interval = settings.POLL_INTERVAL_SECONDS
         self.is_running = False
         self.last_leaderboard_sync = 0
-        self.leaderboard_sync_interval = 3600  # 預設每 1 小時重新同步一次排行榜
+        self.leaderboard_sync_interval = 3600
 
-    async def sync_leaderboard_if_needed(self):
-        """定期更新前 100 名玩家排行榜快取"""
-        now = time.time()
-        if now - self.last_leaderboard_sync > self.leaderboard_sync_interval:
-            logger.info("定時任務觸發：開始同步前 100 名高勝率玩家名單...")
-            # 在背景非同步執行更新
-            loop = asyncio.get_event_loop()
-            success = await loop.run_in_executor(None, leaderboard_mgr.update_local_leaderboard)
-            if success:
-                self.last_leaderboard_sync = now
+    def get_last_checkpoint(self, address: str) -> int:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT last_trade_timestamp FROM sync_checkpoints WHERE address = ?", (address.lower(),))
+            row = cursor.fetchone()
+            return int(row["last_trade_timestamp"]) if row else 0
+
+    def update_checkpoint(self, address: str, timestamp: int):
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO sync_checkpoints (address, last_trade_timestamp, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(address) DO UPDATE SET
+                    last_trade_timestamp = MAX(last_trade_timestamp, excluded.last_trade_timestamp),
+                    updated_at = CURRENT_TIMESTAMP
+            """, (address.lower(), timestamp))
+
+    def is_trade_processed(self, unique_key: str) -> bool:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM copy_trades WHERE tx_hash = ?", (unique_key,))
+            return cursor.fetchone() is not None
 
     async def scan_trader_trades(self, address: str):
-        """非同步掃描單一玩家的最新成交訂單"""
         loop = asyncio.get_event_loop()
-        # 呼叫 API 獲取該地址最近的交易
-        trades = await loop.run_in_executor(None, poly_client.get_trader_recent_trades, address, 5)
+        last_ts = self.get_last_checkpoint(address)
+
+        # 获取最多 20 笔（防止高频漏单）
+        trades = await loop.run_in_executor(None, poly_client.get_trader_recent_trades, address, 20)
         if not trades:
             return
 
+        # 按时间正序处理（从旧到新，确保开仓->加仓->平仓顺序正确）
+        trades.sort(key=lambda x: int(x.get("timestamp", 0) or 0))
+
+        max_seen_ts = last_ts
         for trade in trades:
+            trade_ts = int(trade.get("timestamp", 0) or 0)
             tx_hash = trade.get("transactionHash") or trade.get("hash")
-            if not tx_hash:
+            token_id = str(trade.get("asset_id") or trade.get("tokenId") or "")
+            order_id = str(trade.get("order_id") or trade.get("id") or "")
+
+            # 复合唯一键，杜绝同 tx 多笔成交被去重过滤
+            unique_key = f"{tx_hash}_{token_id}_{order_id}" if tx_hash else None
+            if not unique_key:
                 continue
 
-            # 1. 檢查是否已處理過該筆交易
-            if is_tx_already_copied(tx_hash):
+            # 检查时间戳与去重记录
+            if trade_ts > 0 and trade_ts <= last_ts:
                 continue
 
-            logger.info(f"偵測到目標玩家 [{address[:8]}...] 發起新交易 (Tx: {tx_hash[:10]}...)")
-            add_system_log("INFO", "monitor", f"偵測到玩家 {address[:8]}... 新動作")
+            if self.is_trade_processed(unique_key):
+                continue
 
-            # 2. 意圖識別與金額換算
+            # 记录最大时间戳
+            if trade_ts > max_seen_ts:
+                max_seen_ts = trade_ts
+
+            logger.info(f"捕获玩家 [{address[:8]}...] 有效动作 (TxKey: {unique_key[:16]}...)")
+            trade["composite_key"] = unique_key
+
             trade_plan = trade_matcher.process_target_trade(trade)
             if not trade_plan:
                 continue
 
-            # 3. 提交訂單執行模組
             await loop.run_in_executor(None, trade_executor.execute, trade_plan)
 
-    async def start(self):
-        """啟動常駐監控循環"""
-        self.is_running = True
-        logger.info(f"🚀 PolyCopy 監控引擎已啟動，輪詢間隔: {self.poll_interval} 秒")
-        add_system_log("INFO", "monitor", "監控服務已啟動")
+        # 更新该地址的检查点位
+        if max_seen_ts > last_ts:
+            self.update_checkpoint(address, max_seen_ts)
 
-        # 啟動時先確保有第一批排行榜名單
-        await self.sync_leaderboard_if_needed()
+    async def start(self):
+        self.is_running = True
+        logger.info(f"🚀 PolyCopy 监控引擎已启动 (轮询间隔: {self.poll_interval}s)")
+        add_system_log("INFO", "monitor", "监控主循环服务已启动")
+
+        now = time.time()
+        if now - self.last_leaderboard_sync > self.leaderboard_sync_interval:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, leaderboard_mgr.update_local_leaderboard)
+            self.last_leaderboard_sync = now
 
         while self.is_running:
             try:
-                # 檢查排行榜更新
-                await self.sync_leaderboard_if_needed()
-
-                # 讀取本地監控地址列表
-                tracked_addresses: List[str] = get_all_tracked_addresses()
-                if not tracked_addresses:
-                    logger.warning("目前未獲取到任何監控玩家地址，等待下一次重試...")
-                    await asyncio.sleep(5)
-                    continue
-
-                # 依序/批次檢查目標玩家交易
-                for address in tracked_addresses:
+                tracked = get_all_tracked_addresses()
+                for addr in tracked:
                     if not self.is_running:
                         break
-                    await self.scan_trader_trades(address)
-                    # 避免頻繁發送 API 請求造成 rate limit
-                    await asyncio.sleep(0.05)
+                    await self.scan_trader_trades(addr)
+                    await asyncio.sleep(0.08)  # API 限流缓冲
 
                 await asyncio.sleep(self.poll_interval)
-
             except asyncio.CancelledError:
-                logger.info("監控任務收到終止信號...")
-                self.is_running = False
                 break
             except Exception as e:
-                logger.error(f"監控循環異常: {e}")
-                add_system_log("ERROR", "monitor", f"循環異常: {e}")
+                logger.error(f"监控主循环异常: {e}")
                 await asyncio.sleep(self.poll_interval)
 
     def stop(self):
-        """停止監控"""
         self.is_running = False
-        logger.info("正在停止監控引擎...")
 
 
-# 匯出單例物件
 trade_monitor = TradeMonitor()
