@@ -6,19 +6,22 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    # 钱包与网络配置
-    WALLET_PRIVATE_KEY: str = Field(..., description="Polygon钱包私钥")
+    # 钱包与网络配置（私钥设为可选，未填时自动仅允许模拟盘试运行）
+    WALLET_PRIVATE_KEY: Optional[str] = Field(default=None, description="Polygon钱包私钥，不填则仅运行模拟沙盒")
     RPC_URL: str = Field(default="https://polygon-rpc.com", description="Polygon RPC节点")
 
-    # Polymarket CLOB API 配置
+    # Polymarket CLOB API 配置 (可选)
     POLY_API_KEY: Optional[str] = Field(default=None, description="API Key")
     POLY_API_SECRET: Optional[str] = Field(default=None, description="API Secret")
     POLY_API_PASSPHRASE: Optional[str] = Field(default=None, description="API Passphrase")
 
-    # 运行模式与端口 (固定默认 8899)
+    # 运行模式与端口 (默认固定 8899)
     DRY_RUN: bool = Field(default=True, description="是否为模拟盘模式")
     SERVER_HOST: str = Field(default="0.0.0.0", description="Web仪表盘监听地址")
     SERVER_PORT: int = Field(default=8899, description="Web仪表盘端口")
+
+    # 模拟沙盒资金池配置 (100 到 1000000 USD)
+    SIMULATION_CAPITAL: float = Field(default=10000.0, ge=100.0, le=1000000.0, description="内置虚拟初始资金")
 
     # 跟单与风控参数
     COPY_RATIO: float = Field(default=0.10, ge=0.01, le=1.0, description="跟单资金缩放比例")
@@ -41,5 +44,4 @@ class Settings(BaseSettings):
     )
 
 
-# 导出全局单例配置
 settings = 设置()
