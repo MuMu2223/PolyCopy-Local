@@ -17,7 +17,7 @@ def get_connection():
 
 @contextmanager
 def get_db():
-    """数据库连接上下文管理器，自动提交与关闭"""
+    """数据库连接上下文管理器，自动提交与回滚"""
     conn = get_connection()
     try:
         yield conn
@@ -61,7 +61,7 @@ def init_db():
                 copy_amount_usd REAL,
                 price REAL,
                 shares REAL,
-                status TEXT, -- FILLED / SKIPPED / FAILED / DRY_RUN
+                status TEXT, -- FILLED / SKIPPED / FAILED / DRY_RUN / SUBMITTED
                 error_msg TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -82,7 +82,7 @@ def init_db():
             )
         """)
 
-        # 4. 系统运行日志表（方便 Web 仪表盘实时拉取）
+        # 4. 系统运行日志表（供 Web 仪表盘实时拉取）
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS system_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,6 +90,15 @@ def init_db():
                 module TEXT,
                 message TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # 5. 监控检查点表（解决重启漏单、断点恢复与多交易复合去重）
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS sync_checkpoints (
+                address TEXT PRIMARY KEY,
+                last_trade_timestamp INTEGER DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
