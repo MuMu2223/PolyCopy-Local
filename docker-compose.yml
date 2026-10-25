@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  polycopy-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: polycopy-bot
+    restart: unless-stopped
+    ports:
+      - "8899:8899"
+    volumes:
+      - ./database:/app/database
+      - ./.env:/app/.env
+    environment:
+      - SERVER_PORT=8899
+      - SERVER_HOST=0.0.0.0
